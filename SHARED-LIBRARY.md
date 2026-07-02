@@ -11,7 +11,7 @@ Manage Jenkins -> System -> Global Pipeline Libraries:
 - Retrieval method: Modern SCM / Git
 - Project repository: 이 저장소 URL
 
-에이전트에는 `git`, `curl`, `jq`가 있어야 합니다.
+에이전트에는 `git`, `curl`이 있어야 합니다.
 
 ## Credentials
 

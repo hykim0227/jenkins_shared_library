@@ -1,14 +1,19 @@
+import groovy.json.JsonSlurperClassic
+
 def call(Map args = [:]) {
     String serverUrl = (args.serverUrl ?: 'Z_BOM_URL').toString()
     String tokenId = (args.credentialsId ?: 'Z_BOM_TOKEN').toString()
     String webUrl = (args.webUrl ?: '').toString()
+    String failOn = (args.failOn ?: 'none').toString()
+    int timeoutSeconds = (args.timeoutSeconds ?: 1800) as int
+    int pollSeconds = (args.intervalSeconds ?: 10) as int
 
     List bindings = [string(credentialsId: tokenId, variable: 'ZBOM_TOKEN')]
     List envVars = [
         "ZBOM_TYPE=${args.type ?: 'code'}",
-        "ZBOM_FAIL_ON=${args.failOn ?: 'none'}",
-        "ZBOM_TIMEOUT=${args.timeoutSeconds ?: 1800}",
-        "ZBOM_POLL=${args.intervalSeconds ?: 10}"
+        "ZBOM_FAIL_ON=${failOn}",
+        "ZBOM_TIMEOUT=${timeoutSeconds}",
+        "ZBOM_POLL=${pollSeconds}"
     ]
 
     if (serverUrl ==~ /^https?:\/\/.+/) {
@@ -27,19 +32,18 @@ def call(Map args = [:]) {
 
     withCredentials(bindings) {
         withEnv(envVars) {
-            sh(label: 'Z-BOM scan', script: '''
+            String submitText = sh(label: 'Z-BOM submit', returnStdout: true, script: '''
                 set -eu
 
-                for cmd in curl jq git; do
+                for cmd in curl git; do
                   command -v "$cmd" >/dev/null || { echo "z-bom: missing command: $cmd" >&2; exit 1; }
                 done
 
                 U="${ZBOM_URL%/}"
-                W="${ZBOM_WEB_URL:-$U}"
                 ZIP="$(mktemp -t z-bom-source.XXXXXX)"
                 trap 'rm -f "$ZIP"' EXIT
 
-                echo "z-bom: archiving git-tracked source"
+                echo "z-bom: archiving git-tracked source" >&2
                 git archive --format=zip -o "$ZIP" HEAD
 
                 REPO="${JOB_NAME:-unknown}"
@@ -47,8 +51,8 @@ def call(Map args = [:]) {
                 BRANCH="${BRANCH_NAME:-${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}}"
                 IDEM="${REPO}:${ZBOM_TYPE}:${COMMIT}"
 
-                echo "z-bom: submitting -> ${U}/api/ci/scan (repo=${REPO} type=${ZBOM_TYPE} commit=$(printf '%s' "$COMMIT" | cut -c1-8))"
-                SUBMIT=$(curl -fsS -X POST "${U}/api/ci/scan" \
+                echo "z-bom: submitting -> ${U}/api/ci/scan (repo=${REPO} type=${ZBOM_TYPE} commit=$(printf '%s' "$COMMIT" | cut -c1-8))" >&2
+                curl -fsS -X POST "${U}/api/ci/scan" \
                   -H "Authorization: Token ${ZBOM_TOKEN}" \
                   -H "Idempotency-Key: ${IDEM}" \
                   -F source=JENKINS \
@@ -57,61 +61,101 @@ def call(Map args = [:]) {
                   -F "commit=${COMMIT}" \
                   -F "branch=${BRANCH}" \
                   -F "trigger=JENKINS" \
-                  -F "file=@${ZIP}")
+                  -F "file=@${ZIP};filename=source.zip"
+            ''').trim()
 
-                if [ "$(printf '%s' "$SUBMIT" | jq -r '.skipped // false')" = "true" ]; then
-                  echo "z-bom: integration paused (skipped) - nothing to do"
-                  exit 0
-                fi
+            Map submit = json(submitText)
+            if (submit.skipped == true) {
+                echo 'z-bom: integration paused (skipped) - nothing to do'
+                return
+            }
 
-                RID=$(printf '%s' "$SUBMIT" | jq -r '.analysisRunId // empty')
-                [ -n "$RID" ] || { echo "z-bom: no analysisRunId -> $SUBMIT" >&2; exit 1; }
-                echo "z-bom: analysis run ${RID} (idempotent=$(printf '%s' "$SUBMIT" | jq -r '.idempotent // false'))"
+            String runId = (submit.analysisRunId ?: '').toString()
+            if (!runId) {
+                error "z-bom: no analysisRunId -> ${submitText}"
+            }
+            echo "z-bom: analysis run ${runId} (idempotent=${submit.idempotent ?: false})"
 
-                DEADLINE=$(( $(date +%s) + ZBOM_TIMEOUT ))
-                STATUS="UNKNOWN"
-                while :; do
-                  RUN=$(curl -fsS "${U}/api/analysis-runs/${RID}" -H "Authorization: Token ${ZBOM_TOKEN}") || { echo "z-bom: poll failed" >&2; break; }
-                  STATUS=$(printf '%s' "$RUN" | jq -r '.status // "UNKNOWN"')
-                  echo "z-bom: status=${STATUS}"
-                  case "$STATUS" in COMPLETED|FAILED) break ;; esac
-                  [ "$(date +%s)" -lt "$DEADLINE" ] || { echo "z-bom: timeout after ${ZBOM_TIMEOUT}s (status=${STATUS})" >&2; break; }
-                  sleep "$ZBOM_POLL"
-                done
+            long deadline = System.currentTimeMillis() + (timeoutSeconds * 1000L)
+            String status = 'UNKNOWN'
+            while (true) {
+                Map run = json(sh(label: 'Z-BOM poll', returnStdout: true, script: """
+                    set -eu
+                    curl -fsS "\${ZBOM_URL%/}/api/analysis-runs/${runId}" -H "Authorization: Token \${ZBOM_TOKEN}"
+                """).trim())
+                status = (run.status ?: 'UNKNOWN').toString()
+                echo "z-bom: status=${status}"
+                if (status in ['COMPLETED', 'FAILED']) {
+                    break
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    echo "z-bom: timeout after ${timeoutSeconds}s (status=${status})"
+                    break
+                }
+                sleep time: pollSeconds, unit: 'SECONDS'
+            }
 
-                RESULT=$(curl -fsS "${U}/api/analysis-runs/${RID}/result" -H "Authorization: Token ${ZBOM_TOKEN}" || echo '{}')
-                CRIT=$(printf '%s' "$RESULT" | jq -r '.cveSeverity.CRITICAL // 0')
-                HIGH=$(printf '%s' "$RESULT" | jq -r '.cveSeverity.HIGH // 0')
-                MED=$(printf '%s' "$RESULT"  | jq -r '.cveSeverity.MEDIUM // 0')
-                LOW=$(printf '%s' "$RESULT"  | jq -r '.cveSeverity.LOW // 0')
-                TOTAL=$(printf '%s' "$RESULT" | jq -r '.totalCve // 0')
-                SBOM=$(printf '%s' "$RESULT" | jq -r '.sbomCount // 0')
-                HBOM=$(printf '%s' "$RESULT" | jq -r '.hbomCount // 0')
-                PID=$(printf '%s' "$RESULT" | jq -r '.projectId // empty')
+            Map result = json(sh(label: 'Z-BOM result', returnStdout: true, script: """
+                set -eu
+                curl -fsS "\${ZBOM_URL%/}/api/analysis-runs/${runId}/result" -H "Authorization: Token \${ZBOM_TOKEN}" || echo '{}'
+            """).trim())
+            Map severity = (result.cveSeverity ?: [:]) as Map
+            int critical = intValue(severity.CRITICAL)
+            int high = intValue(severity.HIGH)
+            int medium = intValue(severity.MEDIUM)
+            int low = intValue(severity.LOW)
+            int total = intValue(result.totalCve)
+            int sbom = intValue(result.sbomCount)
+            int hbom = intValue(result.hbomCount)
+            String projectId = (result.projectId ?: '').toString()
+            String reportBase = sh(returnStdout: true, script: 'printf %s "${ZBOM_WEB_URL:-$ZBOM_URL}"').trim()
 
-                printf '%s\\n' '<!-- z-bom-action -->'
-                printf '## Z-BOM SBOM scan result - `%s`\\n\\n' "$STATUS"
-                printf '| item | value |\\n|---|---|\\n'
-                printf '| type | %s |\\n' "$ZBOM_TYPE"
-                printf '| components | SBOM %s / HBOM %s |\\n' "$SBOM" "$HBOM"
-                printf '| vulnerabilities | Critical %s / High %s / Medium %s / Low %s (total %s) |\\n\\n' "$CRIT" "$HIGH" "$MED" "$LOW" "$TOTAL"
-                [ -n "$PID" ] && printf 'Report: %s/project/%s/summary\\n\\n' "${W%/}" "$PID"
+            echo """<!-- z-bom-action -->
+## Z-BOM SBOM scan result - `${status}`
 
-                [ "$STATUS" = "FAILED" ] && { echo "z-bom: analysis failed" >&2; exit 1; }
-                case "$ZBOM_FAIL_ON" in
-                  critical) GATE=$CRIT ;;
-                  high) GATE=$((CRIT + HIGH)) ;;
-                  medium) GATE=$((CRIT + HIGH + MED)) ;;
-                  low) GATE=$((CRIT + HIGH + MED + LOW)) ;;
-                  none) GATE=0 ;;
-                  *) echo "z-bom: invalid failOn=${ZBOM_FAIL_ON}" >&2; exit 1 ;;
-                esac
-                if [ "$ZBOM_FAIL_ON" != "none" ] && [ "$GATE" -gt 0 ]; then
-                  echo "z-bom: fail-on=${ZBOM_FAIL_ON} matched ${GATE} CVE(s)" >&2
-                  exit 1
-                fi
-                echo "z-bom: done"
-            ''')
+| item | value |
+|---|---|
+| type | ${env.ZBOM_TYPE} |
+| components | SBOM ${sbom} / HBOM ${hbom} |
+| vulnerabilities | Critical ${critical} / High ${high} / Medium ${medium} / Low ${low} (total ${total}) |
+${projectId ? "\nReport: ${reportBase.replaceAll('/+$', '')}/project/${projectId}/summary\n" : ''}"""
+
+            if (status == 'FAILED') {
+                error 'z-bom: analysis failed'
+            }
+
+            int gate = 0
+            switch (failOn) {
+                case 'none':
+                    gate = 0
+                    break
+                case 'critical':
+                    gate = critical
+                    break
+                case 'high':
+                    gate = critical + high
+                    break
+                case 'medium':
+                    gate = critical + high + medium
+                    break
+                case 'low':
+                    gate = critical + high + medium + low
+                    break
+                default:
+                    error "z-bom: invalid failOn=${failOn}"
+            }
+            if (failOn != 'none' && gate > 0) {
+                error "z-bom: fail-on=${failOn} matched ${gate} CVE(s)"
+            }
+            echo 'z-bom: done'
         }
     }
+}
+
+private Map json(String text) {
+    new JsonSlurperClassic().parseText(text ?: '{}') as Map
+}
+
+private int intValue(Object value) {
+    value == null ? 0 : value.toString().toInteger()
 }
