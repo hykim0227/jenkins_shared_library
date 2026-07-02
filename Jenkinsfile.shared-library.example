@@ -1,0 +1,19 @@
+@Library('zbom-lib') _
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Z-BOM Scan') {
+            steps {
+                zbomScan(
+                    serverUrl: 'Z_BOM_URL',
+                    credentialsId: 'Z_BOM_TOKEN',
+                    type: 'code',
+                    failOn: 'none',
+                    webUrl: 'Z_BOM_WEB_URL'
+                )
+            }
+        }
+    }
+}
